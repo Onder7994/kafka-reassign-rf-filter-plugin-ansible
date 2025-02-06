@@ -1,0 +1,113 @@
+- block:
+    - name: Get list of Kafka broker IDs
+      set_fact:
+        kafka_broker_list: "{{ groups['kafka_cluster'] | map('extract', hostvars, 'kafka_broker_id') | join(',') }}"
+
+    - name: Generate topics to move json
+      ansible.builtin.copy:
+        dest: "/tmp/kafka_topics_to_move.json"
+        content: |
+          {
+            "topics": [
+              {
+                "topic": "{{ TOPIC_NAME }}"
+              }
+            ],
+            "version": 1
+          }
+
+    - name: Generate reassignment plan for {{ TOPIC_NAME }}
+      ansible.builtin.command: >
+        {{ kafka_install_dir }}/bin/kafka-reassign-partitions.sh
+        --bootstrap-server {{ kafka_host }}:{{ kafka_port }}
+        --generate
+        --topics-to-move-json-file /tmp/kafka_topics_to_move.json
+        --command-config {{ kafka_conf_dir }}/admin_connect.cfg
+        --broker-list "{{ kafka_broker_list }}"
+      register: reassignment_plan
+      changed_when: false
+      when:
+        - TOPIC_NAME is defined and TOPIC_NAME | length > 0
+        - NEW_RF is defined and NEW_RF | int > 0
+      tags:
+        - kafka_replication
+    
+    - name: Show reassignment plan
+      debug:
+        var: reassignment_plan.stdout
+
+    - name: Extract JSON from reassignment plan
+      set_fact:
+        proposed_json: "{{ reassignment_plan.stdout.split('Proposed partition reassignment configuration')[-1] | trim | from_json }}"
+
+    - name: Show proposed json from reassignment_plan
+      debug:
+        var: proposed_json
+  
+    - name: Modify proposed json via custom filter
+      set_fact:
+        updated_proposed_json: "{{ proposed_json | set_rf(NEW_RF|int, kafka_broker_list) }}"
+      when:
+        - proposed_json is defined
+      tags:
+        - kafka_replication
+    
+    - name: Debug updated proposed json
+      debug:
+        var: updated_proposed_json
+      when:
+        - updated_proposed_json is defined
+      tags:
+        - kafka_replication
+    
+    - name: Save modified reassignment JSON
+      ansible.builtin.copy:
+        content: "{{ updated_proposed_json | to_json }}"
+        dest: /tmp/kafka_updated_proposed.json
+      when:
+        - updated_proposed_json is defined
+      tags:
+        - kafka_replication
+    
+    - name: Execute reassignment for {{ TOPIC_NAME }}
+      ansible.builtin.command: >
+        {{ kafka_install_dir }}/bin/kafka-reassign-partitions.sh
+        --bootstrap-server {{ kafka_host }}:{{ kafka_port }}
+        --execute
+        --reassignment-json-file /tmp/kafka_updated_proposed.json
+        --command-config {{ kafka_conf_dir }}/admin_connect.cfg
+      
+      when:
+        - updated_proposed_json is defined
+      tags:
+        - kafka_replication
+    
+    - name: Verify reassignment status for {{ TOPIC_NAME }}
+      ansible.builtin.command: >
+        {{ kafka_install_dir }}/bin/kafka-reassign-partitions.sh
+        --bootstrap-server {{ kafka_host }}:{{ kafka_port }}
+        --verify
+        --reassignment-json-file /tmp/kafka_updated_proposed.json
+        --command-config {{ kafka_conf_dir }}/admin_connect.cfg
+      register: reassignment_status
+      changed_when: false
+      when:
+        - updated_proposed_json is defined
+      tags:
+        - kafka_replication
+
+    - name: Show describe topic {{ TOPIC_NAME }} after reassignment
+      debug:
+        var: reassignment_status.stdout
+        
+    - name: Clean tmp files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop:
+        - { path: "/tmp/kafka_topics_to_move.json" }
+        - { path: "/tmp/kafka_updated_proposed.json" }
+      
+  run_once: true
+  tags:
+    - kafka_replication
